@@ -1,0 +1,454 @@
+import cv2
+import numpy as np
+import serial
+import time
+import itertools
+
+
+# =========================================================
+# ARDUINO
+# =========================================================
+
+arduino = serial.Serial("COM20", 9600, timeout=1)
+time.sleep(2)
+
+print("Arduino conectado!")
+
+
+# =========================================================
+# CÂMERA USB
+# =========================================================
+
+cap = cv2.VideoCapture(1, cv2.CAP_DSHOW)
+
+if not cap.isOpened():
+    print("Erro ao abrir a câmera.")
+    arduino.close()
+    exit()
+
+print("Câmera conectada!")
+
+# Estado atual do LED
+estado = "DESLIGADO"
+
+
+# =========================================================
+# DETECÇÃO VERDE
+# =========================================================
+
+def detectar_verde(frame):
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    lower_green = np.array([35, 50, 50])
+    upper_green = np.array([90, 255, 255])
+
+    mask = cv2.inRange(
+        hsv,
+        lower_green,
+        upper_green
+    )
+
+    kernel = np.ones((5, 5), np.uint8)
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        kernel
+    )
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        kernel
+    )
+
+    contours, _ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    for cnt in contours:
+
+        area = cv2.contourArea(cnt)
+
+        if area < 500:
+            continue
+
+        perimetro = cv2.arcLength(
+            cnt,
+            True
+        )
+
+        if perimetro == 0:
+            continue
+
+        circularidade = (
+            4 * np.pi * area
+            / (perimetro * perimetro)
+        )
+
+        # Círculo verde
+        if circularidade > 0.75:
+
+            (x, y), raio = cv2.minEnclosingCircle(cnt)
+
+            centro = (
+                int(x),
+                int(y)
+            )
+
+            raio = int(raio)
+
+            return True, centro, raio
+
+    return False, None, None
+
+
+# =========================================================
+# DETECÇÃO DO PADRÃO AZUL
+# =========================================================
+
+def detectar_padrao_azul(frame):
+
+    hsv = cv2.cvtColor(frame, cv2.COLOR_BGR2HSV)
+
+    lower_blue = np.array([95, 80, 50])
+    upper_blue = np.array([130, 255, 255])
+
+    mask = cv2.inRange(
+        hsv,
+        lower_blue,
+        upper_blue
+    )
+
+    kernel = np.ones((5, 5), np.uint8)
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_OPEN,
+        kernel
+    )
+
+    mask = cv2.morphologyEx(
+        mask,
+        cv2.MORPH_CLOSE,
+        kernel
+    )
+
+    mask = cv2.erode(
+        mask,
+        np.ones((5, 5), np.uint8),
+        iterations=1
+    )
+
+    contours, _ = cv2.findContours(
+        mask,
+        cv2.RETR_EXTERNAL,
+        cv2.CHAIN_APPROX_SIMPLE
+    )
+
+    candidatos = []
+
+    altura, largura = frame.shape[:2]
+
+    area_minima = max(
+        200,
+        int(altura * largura * 0.00005)
+    )
+
+    for cnt in contours:
+
+        area = cv2.contourArea(cnt)
+
+        if area < area_minima:
+            continue
+
+        x, y, w, h = cv2.boundingRect(cnt)
+
+        proporcao = w / float(h)
+
+        if proporcao < 0.70 or proporcao > 1.30:
+            continue
+
+        preenchimento = area / float(w * h)
+
+        if preenchimento < 0.65:
+            continue
+
+        momentos = cv2.moments(cnt)
+
+        if momentos["m00"] == 0:
+            continue
+
+        cx = momentos["m10"] / momentos["m00"]
+        cy = momentos["m01"] / momentos["m00"]
+
+        candidatos.append(
+            (
+                cx,
+                cy,
+                w,
+                h,
+                area,
+                cnt
+            )
+        )
+
+    # O padrão precisa ter vários quadrados
+    if len(candidatos) < 5:
+        return False, []
+
+    candidatos = sorted(
+        candidatos,
+        key=lambda item: item[4],
+        reverse=True
+    )[:12]
+
+    for grupo in itertools.combinations(
+        candidatos,
+        5
+    ):
+
+        areas = np.array(
+            [item[4] for item in grupo],
+            dtype=float
+        )
+
+        area_mediana = np.median(areas)
+
+        if areas.min() / area_mediana < 0.55:
+            continue
+
+        if areas.max() / area_mediana > 1.80:
+            continue
+
+        tamanhos = np.array(
+            [
+                (item[2] + item[3]) / 2
+                for item in grupo
+            ]
+        )
+
+        tamanho = np.median(tamanhos)
+
+        grupo_ordenado = sorted(
+            grupo,
+            key=lambda item: item[1]
+        )
+
+        topo = grupo_ordenado[:2]
+        meio = grupo_ordenado[2]
+        baixo = grupo_ordenado[3:]
+
+        y_topo = np.mean(
+            [item[1] for item in topo]
+        )
+
+        y_baixo = np.mean(
+            [item[1] for item in baixo]
+        )
+
+        if abs(
+            topo[0][1] - topo[1][1]
+        ) > tamanho * 0.70:
+            continue
+
+        if abs(
+            baixo[0][1] - baixo[1][1]
+        ) > tamanho * 0.70:
+            continue
+
+        if meio[1] <= y_topo + tamanho * 0.35:
+            continue
+
+        if meio[1] >= y_baixo - tamanho * 0.35:
+            continue
+
+        centro_x = (
+            np.mean([item[0] for item in topo])
+            +
+            np.mean([item[0] for item in baixo])
+        ) / 2
+
+        if abs(
+            meio[0] - centro_x
+        ) > tamanho * 0.45:
+            continue
+
+        if abs(
+            topo[0][0] - topo[1][0]
+        ) < tamanho * 0.80:
+            continue
+
+        if abs(
+            baixo[0][0] - baixo[1][0]
+        ) < tamanho * 0.80:
+            continue
+
+        centro_topo = np.mean(
+            [item[0] for item in topo]
+        )
+
+        centro_baixo = np.mean(
+            [item[0] for item in baixo]
+        )
+
+        if abs(
+            centro_topo - centro_baixo
+        ) > tamanho * 0.60:
+            continue
+
+        return True, grupo
+
+    return False, []
+
+
+# =========================================================
+# LOOP PRINCIPAL
+# =========================================================
+
+while True:
+
+    ret, frame = cap.read()
+
+    if not ret:
+        print("Erro ao capturar imagem.")
+        break
+
+
+    # =====================================================
+    # DETECTA VERDE
+    # =====================================================
+
+    verde_detectado, centro, raio = detectar_verde(frame)
+
+    if verde_detectado:
+
+        cv2.circle(
+            frame,
+            centro,
+            raio,
+            (0, 255, 0),
+            3
+        )
+
+        cv2.putText(
+            frame,
+            "VERDE DETECTADO",
+            (
+                centro[0] - 100,
+                centro[1] - raio - 15
+            ),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (0, 255, 0),
+            2
+        )
+
+
+    # =====================================================
+    # DETECTA AZUL
+    # =====================================================
+
+    azul_detectado, quadrados = detectar_padrao_azul(frame)
+
+    if azul_detectado:
+
+        for item in quadrados:
+
+            cx, cy, w, h, area, cnt = item
+
+            x = int(cx - w / 2)
+            y = int(cy - h / 2)
+
+            cv2.rectangle(
+                frame,
+                (x, y),
+                (x + w, y + h),
+                (255, 0, 0),
+                3
+            )
+
+        cv2.putText(
+            frame,
+            "PADRAO AZUL DETECTADO",
+            (30, 50),
+            cv2.FONT_HERSHEY_SIMPLEX,
+            0.8,
+            (255, 0, 0),
+            2
+        )
+
+
+    # =====================================================
+    # CONTROLE DO LED
+    # =====================================================
+
+    # -----------------------------------------------------
+    # VERDE → LIGA
+    # -----------------------------------------------------
+    #
+    # Depois que ligar, continua ligado mesmo se o verde
+    # sair da câmera.
+    #
+
+    if verde_detectado:
+
+        if estado != "VERDE":
+
+            arduino.write(b'G\n')
+
+            print(
+                ">>> VERDE DETECTADO - LED ACESO <<<"
+            )
+
+            estado = "VERDE"
+
+
+    # -----------------------------------------------------
+    # AZUL → DESLIGA
+    # -----------------------------------------------------
+    #
+    # Depois que desligar, continua desligado até aparecer
+    # novamente o verde.
+    #
+
+    elif azul_detectado:
+
+        if estado != "AZUL":
+
+            arduino.write(b'B\n')
+
+            print(
+                ">>> AZUL DETECTADO - LED APAGADO <<<"
+            )
+
+            estado = "AZUL"
+
+
+    # =====================================================
+    # MOSTRA A CÂMERA
+    # =====================================================
+
+    cv2.imshow(
+        "Deteccao da Placa",
+        frame
+    )
+
+    # Q = fechar
+    if cv2.waitKey(1) & 0xFF == ord('q'):
+        break
+
+
+# =========================================================
+# ENCERRAMENTO
+# =========================================================
+
+cap.release()
+cv2.destroyAllWindows()
+
+arduino.close()
+
+print("Programa encerrado.")
