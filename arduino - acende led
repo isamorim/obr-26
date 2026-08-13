@@ -1,0 +1,30 @@
+const int LED = LED_BUILTIN;
+
+void setup() {
+  pinMode(LED, OUTPUT);
+
+  // Começa com o LED apagado
+  digitalWrite(LED, LOW);
+
+  Serial.begin(9600);
+}
+
+void loop() {
+
+  if (Serial.available() > 0) {
+
+    char comando = Serial.read();
+
+    // VERDE = liga o LED
+    if (comando == 'G') {
+      digitalWrite(LED, HIGH);
+      Serial.println("LED LIGADO");
+    }
+
+    // AZUL = desliga o LED
+    else if (comando == 'B') {
+      digitalWrite(LED, LOW);
+      Serial.println("LED DESLIGADO");
+    }
+  }
+}
